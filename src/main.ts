@@ -1,0 +1,209 @@
+import * as THREE from 'three'
+import { EnvironmentCamera } from './camera'
+import { palette, resizeInk } from './render/ink'
+import { skipStillMatrices } from './render/matrices'
+import { createCompound } from './world/compound'
+import { EnvironmentInteractions } from './interactions'
+import { FirstPersonController } from './player/controller'
+import { GamepadInput } from './player/gamepad'
+import { padBindings } from './player/pad-bindings'
+import { createMissionWorld, prepareCompound } from './game/world'
+import { bootMap } from './game/campaign/boot'
+import { MissionRuntime } from './game/runtime'
+import { BasicZombiesRuntime } from './game/zombies/basic-runtime'
+import { getSettings, pixelRatioFor, subscribeSettings } from './game/settings'
+import { installUiSounds } from './game/ui-sound'
+import './style.css'
+
+const canvas = document.querySelector<HTMLCanvasElement>('#world')!
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: 'high-performance' })
+// A small supersampling floor keeps sub-pixel details clean on non-Retina displays.
+// 1.25 is indistinguishable from 1.5 at 100% zoom and shades 31% fewer pixels; 1.0 visibly hardens far strokes.
+let resolutionScale = 1
+// The quality setting caps the pixel ratio (High is the old cap); the frame-time check can lower it further.
+const pixelRatio = () => Math.max(1, pixelRatioFor(window.devicePixelRatio, getSettings().quality) * resolutionScale)
+renderer.setPixelRatio(pixelRatio())
+renderer.outputColorSpace = THREE.SRGBColorSpace
+renderer.toneMapping = THREE.NoToneMapping
+renderer.setClearColor(palette.paper)
+renderer.shadowMap.enabled = false
+
+const scene = new THREE.Scene()
+scene.name = 'Black ballpoint compound'
+// Most of the scene stands still: only the matrices of what moved are recomputed each frame.
+skipStillMatrices(scene)
+scene.background = new THREE.Color(palette.paper)
+// The hostage mission's map: the compound, or a location map with its own geometry (campaign/boot.ts).
+const zombies = new URLSearchParams(location.search).get('mode') === 'zombies'
+const locationMap = zombies ? null : bootMap().build?.() ?? null
+const compound = locationMap?.scenery ?? createCompound()
+const missionWorld = locationMap?.world ?? createMissionWorld(compound)
+if (!locationMap) prepareCompound(compound)
+scene.add(compound)
+scene.add(missionWorld.root)
+
+let frame = 0
+const reportedFrameErrors = new Set<string>()
+let lastTime = performance.now()
+let rendering = false
+let contextLost = false
+let disposed = false
+let mission: BasicZombiesRuntime | MissionRuntime | null = null
+let startupReady = false
+const invalidate = () => {
+  if (!frame && !contextLost && !disposed) {
+    if (!rendering) lastTime = performance.now()
+    frame = requestAnimationFrame(render)
+  }
+}
+const camera = new EnvironmentCamera(canvas, invalidate)
+const interactions = new EnvironmentInteractions(canvas, scene, () => camera.active, invalidate, () => camera.walking)
+const player = new FirstPersonController(canvas, scene, camera, interactions, invalidate)
+// ?mode=zombies plays Dead Ink on the same compound; anything else is the hostage mission.
+mission = zombies
+  ? new BasicZombiesRuntime(scene, camera, player, missionWorld, invalidate, Number(new URLSearchParams(location.search).get('seed')) || undefined)
+  : new MissionRuntime(scene, camera, player, missionWorld, invalidate)
+// Xbox and PlayStation controllers, laid out as Call of Duty's (src/player/gamepad.ts).
+const gamepad = new GamepadInput(padBindings(canvas, player, mission, zombies))
+gamepad.start()
+const frameTimes: number[] = []
+startupReady = !mission
+// Initialization positions the mission camera and settles the menu (including
+// load errors). Reveal only after that state has actually been rendered.
+void mission?.initialized.then(() => { startupReady = true; invalidate() })
+
+function render(now: number) {
+  if (disposed || contextLost) return
+  frame = 0
+  rendering = true
+  const elapsed = (now - lastTime) / 1000
+  const dt = Math.min(elapsed, 0.05)
+  if (player.playing && elapsed < 1) {
+    frameTimes.push(elapsed * 1000); if (frameTimes.length > 600) frameTimes.shift()
+    if (!resolutionSettled && ++resolutionFrames >= 90) adaptResolution()
+  }
+  lastTime = now
+  // Door travel uses real elapsed time even when low FPS caps the physics step.
+  const doorsMoving = interactions.update(elapsed)
+  let moving = false
+  try {
+    moving = player.update(dt) || camera.update(dt)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (!reportedFrameErrors.has(message)) { reportedFrameErrors.add(message); console.error('Frame failed', error) }
+    moving = true
+  }
+  let missionMoving = false
+  try {
+    // Cinematic travel follows real frame time; physics keeps its safe step cap.
+    missionMoving = mission?.update(dt, elapsed) ?? false
+    renderer.render(scene, camera.active)
+  } catch (error) {
+    // One bad frame must never freeze the game: the loop only reschedules itself at the end of a frame,
+    // and after a death nothing else asks for one. Report it (once per message) and keep drawing.
+    const message = error instanceof Error ? error.message : String(error)
+    if (!reportedFrameErrors.has(message)) { reportedFrameErrors.add(message); console.error('Frame failed', error) }
+    missionMoving = true
+  }
+  finally { mission?.finishFrame() }
+  if (startupReady) {
+    canvas.dataset.ready = 'true'
+    if (document.documentElement.hasAttribute('data-loading')) {
+      document.documentElement.removeAttribute('data-loading')
+      document.querySelector<HTMLButtonElement>('#walk-start:not(:disabled)')?.focus({ preventScroll: true })
+    }
+  }
+  if (moving || doorsMoving || missionMoving) invalidate()
+  rendering = false
+}
+
+// Slow GPUs: when play stays under ~40 fps, shade fewer pixels (never below 1×). Stroke widths are in CSS px and keep their size.
+// ponytail: one-way and frame-time based. Frame time cannot tell GPU- from CPU-bound, so a step that
+// does not help is undone and adaptation stops; a reload restores full resolution. Add step-up if players ask.
+let resolutionFrames = 0, resolutionTrial = 0, resolutionSettled = false
+function adaptResolution() {
+  const recent = frameTimes.slice(-90), average = recent.reduce((a, b) => a + b, 0) / recent.length
+  resolutionFrames = 0
+  if (resolutionTrial) {
+    if (average > resolutionTrial * 0.9) { resolutionScale /= 0.8; resolutionSettled = true }
+    resolutionTrial = 0
+  } else if (average > 25 && pixelRatio() > 1) { resolutionTrial = average; resolutionScale *= 0.8 }
+  else return
+  resize()
+}
+
+installUiSounds()
+
+// A new quality setting: start the resolution check over from the new cap.
+subscribeSettings((_, changed) => { if (changed.includes('quality')) { resolutionScale = 1; resolutionSettled = false; resolutionTrial = 0; resize() } })
+
+function resize() {
+  const width = window.innerWidth, height = window.innerHeight
+  renderer.setPixelRatio(pixelRatio())
+  renderer.setSize(width, height, false)
+  camera.resize(width, height)
+  resizeInk(width, height)
+  invalidate()
+}
+window.addEventListener('resize', resize)
+const visibilityChanged = () => {
+  lastTime = performance.now()
+  if (!document.hidden) invalidate()
+}
+document.addEventListener('visibilitychange', visibilityChanged)
+canvas.addEventListener('webglcontextlost', event => {
+  event.preventDefault()
+  contextLost = true
+  cancelAnimationFrame(frame)
+  frame = 0
+  canvas.dataset.ready = 'false'
+})
+canvas.addEventListener('webglcontextrestored', () => {
+  contextLost = false
+  resize()
+})
+resize()
+player.enable()
+
+// Development inspection surface, intentionally absent from production builds and the page UI. A build made
+// with VITE_EXPOSE_HOOKS=1 or VITE_TEST_HOOKS=1 keeps it, so browser checks can drive the built copy (never set for publishing).
+if (import.meta.env.DEV || import.meta.env.VITE_EXPOSE_HOOKS === '1' || import.meta.env.VITE_TEST_HOOKS === '1') {
+  Object.assign(window, {
+    __environment: {
+      scene, renderer, camera,
+      interactions, player, mission,
+      invalidate,
+      stats: () => ({
+        drawCalls: renderer.info.render.calls,
+        triangles: renderer.info.render.triangles,
+        geometries: renderer.info.memory.geometries,
+        textures: renderer.info.memory.textures,
+        fps: frameTimes.length ? 1000 / (frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length) : null,
+        frameP95: frameTimes.length ? [...frameTimes].sort((a,b)=>a-b)[Math.floor(frameTimes.length*0.95)] : null,
+        camera: camera.active.position.toArray(),
+        objects: scene.children[0].children.map(object => ({ name: object.name, kind: object.userData.kind ?? 'environment' })),
+      }),
+    },
+  })
+}
+
+import.meta.hot?.dispose(() => {
+  disposed = true
+  cancelAnimationFrame(frame)
+  window.removeEventListener('resize', resize)
+  document.removeEventListener('visibilitychange', visibilityChanged)
+  gamepad.stop()
+  mission?.dispose()
+  player.dispose()
+  camera.dispose()
+  interactions.dispose()
+  const materials = new Set<THREE.Material>()
+  scene.traverse(object => {
+    if (object instanceof THREE.Mesh || object instanceof THREE.Line) {
+      object.geometry.dispose()
+      for (const material of Array.isArray(object.material) ? object.material : [object.material]) materials.add(material)
+    }
+  })
+  materials.forEach(material => material.dispose())
+  renderer.dispose()
+})

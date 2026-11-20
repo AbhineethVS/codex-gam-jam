@@ -1,0 +1,314 @@
+import * as THREE from 'three'
+import { EnvironmentCamera } from '../camera'
+import { EnvironmentInteractions } from '../interactions'
+import { CollisionWorld } from './collision'
+import { PlayerBody } from './body'
+import { PlayerActions } from './actions'
+import { SprintStamina } from './stamina'
+
+const movementKeys = ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowLeft', 'ArrowDown', 'ArrowRight', 'ShiftLeft', 'ShiftRight', 'Space']
+
+export class FirstPersonController {
+  readonly world: CollisionWorld
+  readonly body: PlayerBody
+  readonly actions: PlayerActions
+  enabled = false
+  playing = false
+  immersive = false
+  missionMode = false
+  movementLocked = false
+  canPlay: () => boolean = () => true
+  onPlayingChange: (playing: boolean) => void = () => {}
+  lookSensitivity: () => number = () => 1
+  /** Sprint stamina: a sprint lasts a few seconds, then recovers (see SPRINT). */
+  readonly stamina = new SprintStamina()
+  /** Remove the sprint limit (a Stamin-Up style perk). */
+  get unlimitedSprint() { return this.stamina.unlimited }
+  set unlimitedSprint(on: boolean) { this.stamina.unlimited = on }
+  /** Sprinting this frame (stamina allowing). */
+  get sprinting() { return this.stamina.sprinting }
+  /** A gamepad's left stick (-1 to 1, y forward) and its sprint click; see src/player/gamepad.ts. */
+  readonly padMove = new THREE.Vector2()
+  padSprint = false
+  /** Downed (Dead Ink's last stand): a slow crawl at this share of walking pace, no sprint, no jump. */
+  crawling = false
+  crawlScale = 0.22
+  /** The rescue campaign's crouch: walking pace times this, and no sprint below 1. */
+  stanceScale = 1
+  /** F held on the keyboard, or the pad's use button held: a teammate's revive runs only while one is. */
+  private useKey = false
+  padUse = false
+  get useHeld() { return this.useKey || this.padUse }
+  /** The last input came from a gamepad: resuming then skips the pointer lock, which a pad press cannot request. */
+  usingPad = false
+  private fallback = false
+  /** The browser has granted a lock at least once, so a later refusal is momentary, not a missing feature. */
+  private lockWorked = false
+  private rawInput = false
+  private lastLook = 0
+  private dragging = false
+  private started = false
+  /** Whether this player has begun playing on this page (the title's Start / Begin has been pressed). */
+  get hasStarted() { return this.started }
+  private walkRotation = new THREE.Quaternion()
+  private pressed = new Set<string>()
+  private abort = new AbortController()
+  private direction = new THREE.Vector3()
+  private forward = new THREE.Vector3()
+  private rotation = new THREE.Euler(0, 0, 0, 'YXZ')
+  private projected = new THREE.Vector3()
+  private hud = document.querySelector<HTMLElement>('#walk-hud')!
+  private panel = document.querySelector<HTMLElement>('#walk-pause')!
+  private startButton = document.querySelector<HTMLButtonElement>('#walk-start')!
+  private prompt = document.querySelector<HTMLElement>('#action-prompt')!
+  private actionLabel = document.querySelector<HTMLElement>('#action-label')!
+  private marker = document.querySelector<HTMLElement>('#action-marker')!
+  private status = document.querySelector<HTMLElement>('#walk-status')!
+
+  constructor(private canvas: HTMLCanvasElement, scene: THREE.Scene, private camera: EnvironmentCamera,
+    private interactions: EnvironmentInteractions, private invalidate: () => void) {
+    this.world = new CollisionWorld(scene)
+    this.body = new PlayerBody(this.world)
+    this.actions = new PlayerActions(scene, this.body)
+    const options = { signal: this.abort.signal }
+    this.camera.onInspect = () => { this.walkRotation.copy(camera.active.quaternion); this.stop() }
+    this.startButton.addEventListener('click', () => this.requestControl(), options)
+    canvas.addEventListener('pointerdown', event => {
+      if (!this.enabled || this.immersive || event.button !== 0) return
+      if (event.isTrusted) this.usingPad = false
+      // Playing on a pad without the lock, then a click: the mouse takes over.
+      if (!this.playing || (!this.fallback && document.pointerLockElement !== this.canvas)) this.requestControl()
+      this.dragging = true
+      if (this.fallback) canvas.setPointerCapture(event.pointerId)
+    }, options)
+    window.addEventListener('pointerup', () => { this.dragging = false }, options)
+    window.addEventListener('pointercancel', () => { this.dragging = false }, options)
+    document.addEventListener('mousemove', this.look, options)
+    document.addEventListener('pointerlockchange', () => {
+      if (document.pointerLockElement === canvas) this.lockWorked = true
+      if (document.pointerLockElement === canvas && this.enabled) this.resume()
+      else if (this.playing && !this.fallback) this.pause()
+    }, options)
+    document.addEventListener('pointerlockerror', this.lockRefused, options)
+    window.addEventListener('keydown', this.keyDown, options)
+    window.addEventListener('keyup', event => { this.pressed.delete(event.code); if (event.code === 'KeyF') this.useKey = false }, options)
+    window.addEventListener('blur', this.pause, options)
+    document.addEventListener('visibilitychange', () => { if (document.hidden) this.pause() }, options)
+  }
+
+  enable() {
+    this.enabled = true
+    this.interactions.setCutaway(false)
+    this.camera.enterWalk()
+    document.body.dataset.mode = 'walk'
+    this.hud.hidden = false
+    if (this.missionMode && this.started) {
+      this.actions.syncCamera(this.camera.active)
+      this.camera.active.quaternion.copy(this.walkRotation)
+    } else this.respawn()
+    this.pause()
+  }
+
+  respawn() {
+    this.actions.reset()
+    this.stamina.reset()
+    const ladder = this.actions.ladders.find(object => object.name.includes('west exterior')) ?? this.actions.ladders[0]
+    const spawn = ladder ? this.actions.ladderPoint(ladder, false) : new THREE.Vector3(-39, 0.1, 4)
+    if (ladder) {
+      const outward = new THREE.Vector3(0, 0, 1).transformDirection(ladder.matrixWorld)
+      spawn.addScaledVector(outward, 2.8)
+    }
+    const floor = this.world.floor(spawn, 1, 2)
+    if (Number.isFinite(floor)) spawn.y = floor + 0.005
+    this.body.teleport(spawn)
+    this.world.refresh()
+    this.body.update(1 / 60, new THREE.Vector3(), false)
+    this.actions.syncCamera(this.camera.active)
+    const target = ladder ? this.actions.ladderPoint(ladder, false).add(new THREE.Vector3(0, 1.5, 0)) : spawn.clone().add(new THREE.Vector3(0, 1.5, -5))
+    this.camera.active.lookAt(target)
+    this.pressed.clear()
+    this.invalidate()
+  }
+
+  requestControl() {
+    if (!this.enabled || this.immersive || !this.canPlay()) return
+    this.canvas.focus({ preventScroll: true })
+    // A gamepad plays without the pointer lock (a pad press cannot request one); a click on the canvas locks it later.
+    if (this.usingPad) { this.resume(); return }
+    if (!this.canvas.requestPointerLock || this.fallback) { this.useFallback(); return }
+    try {
+      // Raw mouse input, as PC shooters use: no OS acceleration, and none of the bogus jumps Chrome on
+      // Windows reports under an accelerated lock, which snap the view. Browsers without the option
+      // refuse it; then lock without it.
+      this.rawInput = true
+      const request = this.canvas.requestPointerLock({ unadjustedMovement: true }) as Promise<void> | undefined
+      request?.catch((error: unknown) => {
+        if (!(error instanceof DOMException && error.name === 'NotSupportedError')) { this.lockRefused(); return }
+        this.rawInput = false
+        try { (this.canvas.requestPointerLock() as Promise<void> | undefined)?.catch(this.lockRefused) } catch { this.lockRefused() }
+      })
+    } catch { this.lockRefused() }
+  }
+
+  /**
+   * Chrome refuses a new lock for about a second after one ends (leaving the window, Escape). Where
+   * locking has worked before, that is momentary: stay paused and let the next click lock again, rather
+   * than dropping for good to drag-to-look, which is only for browsers that cannot lock at all.
+   */
+  private lockRefused = () => {
+    if (this.lockWorked) return
+    this.useFallback()
+  }
+
+  private useFallback = () => {
+    if (!this.enabled || this.immersive) return
+    this.fallback = true
+    this.resume()
+  }
+
+  private resume() {
+    if (this.immersive || !this.canPlay()) return
+    this.playing = true
+    this.started = true
+    this.panel.hidden = true
+    this.hud.dataset.playing = 'true'
+    this.onPlayingChange(true)
+    this.canvas.focus({ preventScroll: true })
+    this.invalidate()
+  }
+
+  pause = () => {
+    this.pressed.clear()
+    this.padMove.set(0, 0); this.padSprint = false
+    this.dragging = false
+    this.playing = false
+    this.body.velocity.x = 0
+    this.body.velocity.z = 0
+    if (document.pointerLockElement === this.canvas) document.exitPointerLock()
+    this.prompt.hidden = true
+    this.marker.hidden = true
+    this.hud.dataset.playing = 'false'
+    this.panel.hidden = !this.enabled
+    this.startButton.textContent = this.missionMode ? (this.started ? 'Resume mission' : 'Begin mission') : this.started ? 'Resume walk' : 'Start walking'
+    this.onPlayingChange(false)
+    this.invalidate()
+  }
+
+  private look = (event: MouseEvent) => {
+    if (!this.enabled || !this.playing || (document.pointerLockElement !== this.canvas && !(this.fallback && this.dragging))) return
+    // Without raw input, a lock can report one absurd movement out of nowhere (Chrome on Windows). A hand
+    // cannot go from nearly still to that in one event, so skip it rather than snap the view.
+    const size = Math.abs(event.movementX) + Math.abs(event.movementY)
+    const spike = !this.rawInput && document.pointerLockElement === this.canvas && size > 300 && size > 8 * (this.lastLook + 10)
+    if (!spike) this.lastLook = size
+    if (spike) return
+    this.rotation.setFromQuaternion(this.camera.active.quaternion, 'YXZ')
+    const sensitivity = 0.0022 * this.lookSensitivity()
+    this.rotation.y -= event.movementX * sensitivity
+    this.rotation.x = THREE.MathUtils.clamp(this.rotation.x - event.movementY * sensitivity, -1.5, 1.5)
+    this.camera.active.quaternion.setFromEuler(this.rotation)
+    this.invalidate()
+  }
+
+  /** Turn the view by a gamepad's right stick: radians, already scaled by its sensitivity. */
+  padLook(yaw: number, pitch: number) {
+    if (!this.enabled || !this.playing || this.immersive) return
+    this.rotation.setFromQuaternion(this.camera.active.quaternion, 'YXZ')
+    this.rotation.y -= yaw
+    this.rotation.x = THREE.MathUtils.clamp(this.rotation.x + pitch, -1.5, 1.5)
+    this.camera.active.quaternion.setFromEuler(this.rotation)
+    this.invalidate()
+  }
+
+  /** A gamepad's jump, as Space. */
+  padJump() {
+    if (this.enabled && this.playing && !this.immersive && !this.movementLocked && !this.actions.traversing && !this.crawling) this.body.jump()
+  }
+
+  private keyDown = (event: KeyboardEvent) => {
+    if (!this.enabled || this.immersive || event.ctrlKey || event.metaKey || event.altKey) return
+    if (event.target instanceof HTMLElement && event.target.closest('button, summary, input, textarea, select, [contenteditable="true"]')) return
+    if (event.code === 'Escape') { this.pause(); return }
+    if (!this.playing) return
+    if (event.code === 'KeyF') this.useKey = true
+    if (this.movementLocked) return
+    if (movementKeys.includes(event.code)) {
+      event.preventDefault()
+      this.pressed.add(event.code)
+      if (event.code === 'Space' && !event.repeat && !this.actions.traversing && !this.crawling) this.body.jump()
+    }
+    if (event.code === 'KeyF' && !event.repeat) { event.preventDefault(); this.actions.activate(this.camera.active) }
+    if (event.code === 'KeyR' && !event.repeat && !this.missionMode) { event.preventDefault(); this.respawn() }
+    this.invalidate()
+  }
+
+  update(dt: number) {
+    if (!this.enabled || this.immersive || !this.playing) return false
+    if (this.movementLocked) {
+      this.prompt.hidden = true; this.marker.hidden = true; this.status.textContent = 'Escaping by jeep'
+      return true
+    }
+    this.world.refresh()
+    if (!this.actions.updateTraversal(dt)) {
+      let x = Number(this.pressed.has('KeyD') || this.pressed.has('ArrowRight')) - Number(this.pressed.has('KeyA') || this.pressed.has('ArrowLeft'))
+      let z = Number(this.pressed.has('KeyW') || this.pressed.has('ArrowUp')) - Number(this.pressed.has('KeyS') || this.pressed.has('ArrowDown'))
+      // Keys win; otherwise the stick, whose push sets the pace (a light push walks).
+      const analog = !x && !z && this.padMove.lengthSq() > 0
+      if (analog) { x = this.padMove.x; z = this.padMove.y }
+      this.camera.active.getWorldDirection(this.forward)
+      this.forward.y = 0
+      this.forward.normalize()
+      this.direction.set(-this.forward.z, 0, this.forward.x).multiplyScalar(x).addScaledVector(this.forward, z)
+      if (!analog || this.direction.lengthSq() > 1) this.direction.normalize()
+      const wantsSprint = !this.crawling && this.stanceScale >= 1 && (this.pressed.has('ShiftLeft') || this.pressed.has('ShiftRight') || this.padSprint)
+      this.body.speedScale = (this.crawling ? this.crawlScale : 1) * this.stanceScale
+      this.body.update(dt, this.direction, this.stamina.update(dt, wantsSprint, this.direction.lengthSq() > 0.01))
+    } else this.stamina.update(dt, false, false)
+    if (this.body.position.y < -20 || Math.max(Math.abs(this.body.position.x), Math.abs(this.body.position.z)) > 1150) this.respawn()
+    this.actions.syncCamera(this.camera.active, dt)
+    const target = this.actions.findTarget(this.camera.active)
+    this.prompt.hidden = !target
+    this.marker.hidden = !target
+    if (target) {
+      this.actionLabel.textContent = target.label
+      this.marker.textContent = target.kind === 'door' ? '▯' : target.kind === 'ladder' ? '☷' : target.kind === 'zipline' ? '↘' : target.kind === 'pickup' ? '+' : '⚙'
+      this.prompt.dataset.kind = target.kind
+      this.projected.copy(target.point).project(this.camera.active)
+      this.marker.hidden = Math.abs(this.projected.x) > 0.95 || Math.abs(this.projected.y) > 0.9 || this.projected.z > 1
+      this.marker.style.left = `${(this.projected.x + 1) * 50}%`
+      this.marker.style.top = `${(1 - this.projected.y) * 50}%`
+    }
+    const ride = this.actions.riding
+    const state = ride ? `Riding to ${ride.destination} · ${Math.round((1 - ride.remaining / ride.distance) * 100)}%` :
+      this.actions.climbing ? (this.actions.climbing.descending ? 'Climbing down' : 'Climbing up') :
+      !this.body.grounded ? 'In the air' : this.direction.lengthSq() > 0 ?
+        (this.sprinting ? 'Sprinting' : 'Walking') : 'On foot'
+    this.status.textContent = this.fallback ? `${state} · drag to look` : state
+    return true
+  }
+
+  setImmersive(active: boolean) {
+    if (active && !this.enabled) this.enable()
+    this.immersive = active
+    this.camera.immersive = active
+    this.actions.reset()
+    this.body.velocity.set(0, 0, 0)
+    this.pause()
+    this.actions.syncCamera(this.camera.active)
+  }
+
+  stop() {
+    this.enabled = false
+    this.pause()
+    this.actions.reset()
+    this.hud.hidden = true
+    delete document.body.dataset.mode
+  }
+
+  dispose() {
+    this.stop()
+    this.abort.abort()
+    this.camera.onInspect = () => {}
+    this.world.dispose()
+  }
+}
