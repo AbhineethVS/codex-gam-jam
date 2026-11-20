@@ -55,5 +55,3 @@ Open the address shown in the terminal.
 ## Credits
 
 Some art, assets and gameplay mechanics were taken from open-source projects.
-
-Sound sources are listed in [public/sounds/CREDITS.md](public/sounds/CREDITS.md).
