@@ -3,7 +3,11 @@
   <h1>Dead Ink</h1>
   <p>A solo browser shooting game with a hand-drawn paper look.</p>
   <p>Play endless zombie rounds or switch to Operation Safe Return and rescue the hostages.</p>
-  <p><strong><a href="https://youtu.be/-Qa60i-NFZM">Watch the gameplay demo</a></strong></p>
+  <p>
+    <strong><a href="https://dead-ink.vercel.app/">Play the live game</a></strong>
+    ·
+    <strong><a href="https://youtu.be/-Qa60i-NFZM">Watch the gameplay demo</a></strong>
+  </p>
 </div>
 
 ## Screenshots
