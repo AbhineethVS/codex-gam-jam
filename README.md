@@ -4,11 +4,21 @@ A solo browser shooting game with a hand-drawn paper look.
 
 Play endless zombie rounds or switch to Operation Safe Return and rescue the hostages.
 
+**[Watch the gameplay demo](https://youtu.be/-Qa60i-NFZM)**
+
 ## Screenshots
 
 ![Game menu](docs/menu.png)
 
 ![Zombie mode](docs/gameplay.png)
+
+![Sniper scope](docs/rescue-scope.png)
+
+![Scout drone](docs/rescue-drone.png)
+
+![Hostage rescue combat](docs/rescue-combat.png)
+
+![Sniper combat](docs/rescue-sniper.png)
 
 ## Features
 
